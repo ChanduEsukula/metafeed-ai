@@ -1,0 +1,14 @@
+{
+  "dataset": "KuaiRec 2.0",
+  "source_file": "data/raw/kuairec/KuaiRec 2.0/data/big_matrix.csv",
+  "split_strategy": "global_chronological",
+  "train_end_utc": "2020-08-10T00:00:00Z",
+  "validation_end_utc": "2020-08-31T00:00:00Z",
+  "observed_counts": {
+    "train": 8787755,
+    "validation": 2130071,
+    "test": 1612980
+  },
+  "target_definition": null,
+  "version": 1
+}
