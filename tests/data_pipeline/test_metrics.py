@@ -34,3 +34,29 @@ def test_invalid_k():
 
     with pytest.raises(ValueError):
         ndcg_at_k([1], {1}, -1)
+
+
+@pytest.mark.parametrize(
+    "metric",
+    [recall_at_k, ndcg_at_k],
+)
+def test_duplicate_recommendations_rejected(metric):
+    with pytest.raises(ValueError, match="unique"):
+        metric([1, 1], {1}, 2)
+
+
+def test_ndcg_exact_ordering():
+    import math
+
+    expected = (
+        1 / math.log2(3)
+        + 1 / math.log2(4)
+    ) / (
+        1 + 1 / math.log2(3)
+    )
+
+    assert ndcg_at_k([3, 1, 2], {1, 2}, 3) == pytest.approx(expected)
+
+
+def test_ndcg_is_bounded():
+    assert 0 <= ndcg_at_k([3, 1, 2], {1, 2}, 3) <= 1
