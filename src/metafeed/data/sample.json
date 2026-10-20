@@ -1,0 +1,17 @@
+{
+  "users": ["alice", "bob", "charlie", "diana", "eve"],
+  "items": [
+    "video_001", "video_002", "video_003",
+    "video_004", "video_005", "video_006"
+  ],
+  "interactions": [
+    {"user_id": "alice", "item_id": "video_001"},
+    {"user_id": "alice", "item_id": "video_002"},
+    {"user_id": "bob", "item_id": "video_001"},
+    {"user_id": "bob", "item_id": "video_003"},
+    {"user_id": "charlie", "item_id": "video_001"},
+    {"user_id": "charlie", "item_id": "video_004"},
+    {"user_id": "diana", "item_id": "video_002"},
+    {"user_id": "diana", "item_id": "video_003"}
+  ]
+}
