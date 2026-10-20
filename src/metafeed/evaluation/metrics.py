@@ -1,7 +1,17 @@
-"""Recommendation ranking metrics for held-out relevant items."""
+"""Binary recommendation ranking metrics."""
 
 import math
 from collections.abc import Sequence
+
+
+def _validate_recommendations(
+    recommended: Sequence[int],
+    k: int,
+) -> None:
+    if k <= 0:
+        raise ValueError("k must be positive")
+    if len(recommended) != len(set(recommended)):
+        raise ValueError("recommendations must contain unique item IDs")
 
 
 def recall_at_k(
@@ -9,14 +19,13 @@ def recall_at_k(
     relevant: set[int],
     k: int,
 ) -> float:
-    if k <= 0:
-        raise ValueError("k must be positive")
+    _validate_recommendations(recommended, k)
 
     if not relevant:
         return 0.0
 
-    retrieved = set(recommended[:k])
-    return len(retrieved & relevant) / len(relevant)
+    hits = len(set(recommended[:k]) & relevant)
+    return hits / len(relevant)
 
 
 def ndcg_at_k(
@@ -24,8 +33,7 @@ def ndcg_at_k(
     relevant: set[int],
     k: int,
 ) -> float:
-    if k <= 0:
-        raise ValueError("k must be positive")
+    _validate_recommendations(recommended, k)
 
     if not relevant:
         return 0.0
@@ -36,11 +44,9 @@ def ndcg_at_k(
         if item in relevant
     )
 
-    ideal_hits = min(k, len(relevant))
-
     idcg = sum(
         1.0 / math.log2(rank + 2)
-        for rank in range(ideal_hits)
+        for rank in range(min(k, len(relevant)))
     )
 
-    return dcg / idcg if idcg > 0 else 0.0
+    return dcg / idcg
