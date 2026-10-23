@@ -4,6 +4,7 @@
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from metafeed.data_pipeline.kuairec import iter_kuairec
 from metafeed.data_pipeline.splits import assign_split
@@ -32,6 +33,13 @@ class EvaluationResult:
     metrics: dict[str, float]
 
 
+class RankingModel(Protocol):
+    catalog: set[int]
+    training_users: set[int]
+
+    def recommend(self, user_id: int, k: int, excluded_items: set[int]) -> list[int]: ...
+
+
 def evaluate_popularity(
     path: Path,
     config: EvaluationConfig,
@@ -46,6 +54,19 @@ def evaluate_popularity(
         config.positive_threshold,
     )
 
+    return evaluate_ranker(path, config, model)
+
+
+def evaluate_ranker(
+    path: Path,
+    config: EvaluationConfig,
+    model: RankingModel,
+) -> EvaluationResult:
+    """Shared population, exclusions and metrics for fitted ranking models.
+
+    The caller must verify catalog/users come from the complete training split.
+    This is the original popularity evaluation loop, unchanged.
+    """
     histories: dict[int, set[int]] = defaultdict(set)
     ground_truth: dict[int, set[int]] = defaultdict(set)
 
