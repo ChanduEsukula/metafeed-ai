@@ -125,3 +125,28 @@ def test_invalid_temperature_rejected():
             {1: frozenset({10}), 2: frozenset({20})},
             temperature=0,
         )
+
+
+def test_repeated_users_mask_all_other_positive_targets():
+    users = torch.tensor([0, 0, 1])
+    items = torch.tensor([0, 1, 2])
+    vectors = torch.eye(3, requires_grad=True)
+    lookup = {0: frozenset({0, 1}), 1: frozenset({2})}
+    loss = masked_contrastive_loss(vectors, torch.eye(3), users, items, lookup)
+    logits = torch.eye(3) / 0.1
+    logits[0, 1] = logits[1, 0] = torch.finfo(logits.dtype).min
+    expected = torch.nn.functional.cross_entropy(logits, torch.arange(3))
+    torch.testing.assert_close(loss, expected)
+    loss.backward()
+    assert torch.isfinite(vectors.grad).all()
+
+
+def test_all_known_positive_batch_has_zero_gradient():
+    vectors = torch.randn(3, 4, requires_grad=True)
+    loss = masked_contrastive_loss(
+        vectors, torch.randn(3, 4), torch.tensor([0, 0, 0]),
+        torch.tensor([0, 1, 2]), {0: frozenset({0, 1, 2})},
+    )
+    assert loss.item() == 0
+    loss.backward()
+    assert torch.count_nonzero(vectors.grad) == 0
