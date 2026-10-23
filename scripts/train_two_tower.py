@@ -143,6 +143,31 @@ def save_checkpoint(checkpoint, output):
         torch.save(checkpoint, handle)
 
 
+def epoch_checkpoint_path(output: Path, epoch: int) -> Path:
+    """Run-specific stem plus a sortable, one-based epoch identifier."""
+    if epoch <= 0:
+        raise ValueError("epoch must be positive")
+    return output.with_name(f"{output.stem}.epoch-{epoch:04d}{output.suffix or '.pt'}")
+
+
+def training_snapshot(model, metadata, user_map, item_map, event_count, diagnostics):
+    """Copy to CPU for serialization without moving the active training model."""
+    return {
+        **metadata,
+        "model_state_dict": {
+            name: value.detach().cpu().clone()
+            for name, value in model.state_dict().items()
+        },
+        "user_map": user_map, "item_map": item_map,
+        "losses": [stats["mean_training_loss"] for stats in diagnostics],
+        "training_events": event_count,
+        "epoch_diagnostics": list(diagnostics),
+        "completed_epochs": len(diagnostics),
+        "epoch_checkpoints": metadata.get("epoch_checkpoints", [])[:len(diagnostics)],
+        "sampler": "deterministic_unique_items",
+    }
+
+
 def restore_checkpoint(output):
     """Use restricted loading and validate weights in a fresh CPU model."""
     checkpoint = torch.load(output, map_location="cpu", weights_only=True)
@@ -167,6 +192,8 @@ def main():
     parser.add_argument("--source", type=Path, help="Override configured CSV path")
     parser.add_argument("--report", type=Path, help="Exclusive JSON report; defaults beside checkpoint")
     parser.add_argument("--prepare-only", action="store_true", help="Assess preprocessing without training")
+    parser.add_argument("--save-every-epoch", action="store_true",
+                        help="Save exclusive <output-stem>.epoch-NNNN.pt snapshots")
     args = parser.parse_args()
     report_path = args.report or args.output.with_suffix(".json")
     if report_path.resolve() == args.output.resolve():
@@ -174,8 +201,6 @@ def main():
     if report_path.exists():
         raise FileExistsError(f"Report already exists: {report_path}")
 
-    if not args.prepare_only and args.output.exists():
-        raise FileExistsError(f"Checkpoint already exists: {args.output}")
 
     if min(
         args.max_events,
@@ -184,6 +209,17 @@ def main():
         args.embedding_dim,
     ) <= 0:
         parser.error("Training parameters must be positive")
+
+    epoch_outputs = (
+        [epoch_checkpoint_path(args.output, epoch) for epoch in range(1, args.epochs + 1)]
+        if args.save_every_epoch and not args.prepare_only else []
+    )
+    if not args.prepare_only:
+        for output_path in [args.output, *epoch_outputs]:
+            if report_path.resolve() == output_path.resolve():
+                parser.error("Report and checkpoint paths must differ")
+            if output_path.exists():
+                raise FileExistsError(f"Checkpoint already exists: {output_path}")
 
     if args.seed < 0 or args.seed >= 2**32:
         parser.error("seed must be in [0, 2**32)")
@@ -231,6 +267,9 @@ def main():
         "seed": args.seed, "device": str(device),
         "batch_size": args.batch_size, "embedding_dim": args.embedding_dim,
         "epochs": args.epochs,
+        "save_every_epoch": args.save_every_epoch,
+        "epoch_checkpoints": [str(path) for path in epoch_outputs],
+        "learning_rate": 0.001, "temperature": 0.1,
     }
     print(json.dumps(metadata, sort_keys=True), flush=True)
     if args.prepare_only:
@@ -258,23 +297,18 @@ def main():
         )
         diagnostics.append(stats)
         print(json.dumps(stats, sort_keys=True), flush=True)
+        if args.save_every_epoch:
+            save_checkpoint(
+                training_snapshot(model, metadata, user_map, item_map, len(pairs), diagnostics),
+                epoch_outputs[epoch],
+            )
 
     losses = [stats["mean_training_loss"] for stats in diagnostics]
     output = args.output
 
-    checkpoint = {
-        "model_state_dict": model.cpu().state_dict(),
-        "user_map": user_map,
-        "item_map": item_map,
-        "embedding_dim": args.embedding_dim,
-        "seed": args.seed,
-        "losses": losses,
-        "training_events": len(pairs),
-        "epoch_diagnostics": diagnostics,
-        "batch_size": args.batch_size,
-        "sampler": "deterministic_unique_items",
-        **metadata,
-    }
+    checkpoint = training_snapshot(
+        model, metadata, user_map, item_map, len(pairs), diagnostics,
+    )
 
     save_checkpoint(checkpoint, output)
     restored_model, restored = restore_checkpoint(output)
@@ -286,6 +320,7 @@ def main():
 
     metadata.update({
         "epoch_diagnostics": diagnostics,
+        "completed_epochs": len(diagnostics),
         "total_elapsed_seconds": time.perf_counter() - started,
         "process_peak_rss_bytes": process_peak_rss_bytes(),
         "checkpoint": str(output), "checkpoint_restoration": "PASS",

@@ -54,6 +54,13 @@ class TwoTowerRanker:
             raise ValueError("Checkpoint training protocol does not match evaluation")
         self.source_sha256 = checkpoint.get("source_sha256")
         self.sampling = checkpoint.get("sampling", {})
+        self.experiment_settings = {
+            key: checkpoint.get(key)
+            for key in ("seed", "embedding_dim", "batch_size", "training_events",
+                        "epochs", "completed_epochs", "learning_rate", "temperature",
+                        "positive_lookup_scope", "selection")
+        }
+        self.epoch_diagnostics = checkpoint.get("epoch_diagnostics", [])
         # Preserve the caller's RNG: constructing a model must not affect it.
         with torch.random.fork_rng(devices=[]):
             self.model = TwoTowerModel(len(self.user_map), len(self.item_map), dimension)
