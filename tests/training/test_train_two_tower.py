@@ -74,7 +74,11 @@ def test_repeated_training_reproducible():
     pairs = [(0, 0), (0, 1), (1, 2), (1, 1), (0, 0)]
     first, _, _, stats = run_epoch(pairs, batch_size=3)
     second, _, _, repeated = run_epoch(pairs, batch_size=3)
-    assert stats == repeated
+    timing_keys = {"elapsed_seconds", "events_per_second", "effective_events_per_second",
+                   "process_peak_rss_bytes"}
+    assert {k: v for k, v in stats.items() if k not in timing_keys} == {
+        k: v for k, v in repeated.items() if k not in timing_keys
+    }
     for key, value in first.state_dict().items():
         assert torch.equal(value, second.state_dict()[key])
 
@@ -156,13 +160,96 @@ def test_cli_uses_only_training_positives(tmp_path, monkeypatch):
     ])
     training.main()
     _, checkpoint = training.restore_checkpoint(output)
-    assert checkpoint["user_map"] == {10: 0, 30: 1}
-    assert checkpoint["item_map"] == {20: 0, 40: 1}
+    assert checkpoint["user_map"] == {10: 0, 30: 1, 777: 2}
+    assert checkpoint["item_map"] == {20: 0, 40: 1, 777: 2}
     assert checkpoint["training_events"] == 3
     assert checkpoint["epoch_diagnostics"][0]["visited_events"] == 3
-    assert checkpoint["positive_lookup_scope"] == "sampled_training_positives_only"
+    assert checkpoint["positive_lookup_scope"] == "complete_training_split"
     original = output.read_bytes()
-    monkeypatch.setattr(training, "iter_kuairec", lambda _: pytest.fail("Should fail before reading"))
+    monkeypatch.setattr(training, "sample_training_data", lambda *args: pytest.fail("Should fail before reading"))
     with pytest.raises(FileExistsError):
         training.main()
     assert output.read_bytes() == original
+
+
+@pytest.mark.parametrize("name", ["cpu", "cuda"])
+def test_device_selection(name, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert training.select_device(name).type == name
+
+
+def test_unavailable_cuda_fails_explicitly(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CUDA is unavailable"):
+        training.select_device("cuda")
+
+
+def test_invalid_device():
+    with pytest.raises(ValueError, match="Unsupported device"):
+        training.select_device("tpu")
+
+
+def test_epoch_reports_timing_and_memory():
+    _, _, _, stats = run_epoch([(0, 0), (1, 1)])
+    assert stats["elapsed_seconds"] > 0
+    assert stats["events_per_second"] == pytest.approx(2 / stats["elapsed_seconds"])
+    assert stats["effective_events_per_second"] > 0
+    assert stats["cuda_peak_allocated_bytes"] is None
+    assert stats["cuda_peak_reserved_bytes"] is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA hardware unavailable")
+def test_actual_cuda_step():
+    training.configure_reproducibility(42)
+    model = TwoTowerModel(2, 2, 4).to(training.select_device("cuda"))
+    optimizer = torch.optim.Adam(model.parameters())
+    stats = training.train_epoch(
+        model, optimizer, [(0, 0), (1, 1)],
+        {0: frozenset({0}), 1: frozenset({1})}, 2, 42, 0,
+    )
+    assert stats["optimizer_steps"] == 1
+    assert stats["cuda_peak_allocated_bytes"] > 0
+    assert stats["cuda_peak_reserved_bytes"] >= stats["cuda_peak_allocated_bytes"]
+
+
+def test_prepare_only_reports_without_training(tmp_path, monkeypatch):
+    import sys
+    import json
+    from metafeed.data_pipeline.splits import TemporalBoundaries
+    from metafeed.training.kuairec_dataset import sample_training_data
+
+    source = tmp_path / "source.csv"
+    source.write_text(
+        "user_id,video_id,play_duration,video_duration,timestamp,watch_ratio\n"
+        "1,10,1000,1000,1,1\n1,20,1000,1000,2,1\n"
+    )
+    prepared = sample_training_data(source, TemporalBoundaries(100, 200), 1, 42)
+    monkeypatch.setattr(training, "sample_training_data", lambda *args: prepared)
+    monkeypatch.setattr(training, "TwoTowerModel", lambda **kwargs: pytest.fail("No training"))
+    output, report = tmp_path / "model.pt", tmp_path / "report.json"
+    monkeypatch.setattr(sys, "argv", [
+        "train_two_tower.py", "--prepare-only", "--max-events", "1", "--source", str(source),
+        "--output", str(output), "--report", str(report),
+    ])
+    training.main()
+    assert not output.exists()
+    data = json.loads(report.read_text())
+    assert data["sampling"]["known_positive_pairs"] == 2
+    assert data["source_sha256"]
+    assert data["config_sha256"]
+    assert data["deterministic_algorithms"] is True
+    original = report.read_bytes()
+    with pytest.raises(FileExistsError, match="Report already exists"):
+        training.main()
+    assert report.read_bytes() == original
+
+
+def test_cuda_unavailable_fails_before_dataset_scan(tmp_path, monkeypatch):
+    import sys
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(training, "sample_training_data", lambda *args: pytest.fail("No dataset scan"))
+    monkeypatch.setattr(sys, "argv", [
+        "train_two_tower.py", "--device", "cuda", "--output", str(tmp_path / "model.pt"),
+    ])
+    with pytest.raises(RuntimeError, match="CUDA is unavailable"):
+        training.main()

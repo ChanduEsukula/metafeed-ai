@@ -146,3 +146,98 @@ def iter_unique_positive_batches(
                 dtype=torch.long,
             ),
         )
+
+
+@dataclass(frozen=True)
+class SampledTrainingData:
+    data: TrainingData
+    known_positives: dict[int, frozenset[int]]
+    diagnostics: dict
+
+
+def sample_training_data(
+    path: Path,
+    boundaries: TemporalBoundaries,
+    max_events: int,
+    seed: int,
+    positive_threshold: float = 1.0,
+) -> SampledTrainingData:
+    """Uniform event reservoir across the COMPLETE positive training split.
+
+    Each positive event (including repeats) has equal selection probability.
+    Memory is O(sample size + distinct training-positive pairs + catalog).
+    All training observations define ID maps; held-out rows define nothing.
+    Coverage of every user/item/day is measured, not guaranteed by sampling.
+    Reproducibility requires the same source bytes, order, seed and settings.
+    """
+    import hashlib
+    import json
+    import random
+    from collections import Counter, defaultdict
+
+    if max_events <= 0:
+        raise ValueError("max_events must be positive")
+    if not 0 <= positive_threshold < float("inf"):
+        raise ValueError("Invalid positive threshold")
+
+    rng = random.Random(seed)
+    users, items = set(), set()
+    history = defaultdict(set)
+    reservoir = []
+    days = Counter()
+    train_events = positives = 0
+    for index, event in enumerate(iter_kuairec(path)):
+        if assign_split(event, boundaries) != "train":
+            continue
+        train_events += 1
+        users.add(event.user_id)
+        items.add(event.video_id)
+        if event.watch_ratio < positive_threshold:
+            continue
+        positives += 1
+        history[event.user_id].add(event.video_id)
+        days[int(event.timestamp // 86400)] += 1
+        row = (event.user_id, event.video_id, event.timestamp, index)
+        if len(reservoir) < max_events:
+            reservoir.append(row)
+        else:
+            slot = rng.randrange(positives)
+            if slot < max_events:
+                reservoir[slot] = row
+
+    user_map = {user: index for index, user in enumerate(sorted(users))}
+    item_map = {item: index for index, item in enumerate(sorted(items))}
+    pairs = tuple((user_map[u], item_map[i]) for u, i, _, _ in reservoir)
+    # Reuse mapped item integers across users rather than allocate one per pair.
+    known = {
+        user_map[user]: frozenset(item_map[item] for item in positive_items)
+        for user, positive_items in history.items()
+    }
+    sampled_users = {u for u, _, _, _ in reservoir}
+    sampled_items = {i for _, i, _, _ in reservoir}
+    positive_items = set().union(*history.values()) if history else set()
+    sample_days = Counter(int(t // 86400) for _, _, t, _ in reservoir)
+    diagnostics = {
+        "strategy": "uniform_positive_event_reservoir_v1",
+        "seed": seed,
+        "max_events": max_events,
+        "training_events": train_events,
+        "training_positive_events": positives,
+        "known_positive_pairs": sum(map(len, known.values())),
+        "training_users": len(users), "training_items": len(items),
+        "positive_users": len(history), "positive_items": len(positive_items),
+        "sampled_events": len(pairs),
+        "sampled_users": len(sampled_users), "sampled_items": len(sampled_items),
+        "user_coverage": len(sampled_users) / len(users) if users else 0.0,
+        "item_coverage": len(sampled_items) / len(items) if items else 0.0,
+        "positive_user_coverage": len(sampled_users) / len(history) if history else 0.0,
+        "positive_item_coverage": len(sampled_items) / len(positive_items) if positive_items else 0.0,
+        "training_positive_events_by_utc_day": dict(sorted(days.items())),
+        "sampled_events_by_utc_day": dict(sorted(sample_days.items())),
+        "sample_sha256": hashlib.sha256(
+            json.dumps(reservoir, separators=(",", ":")).encode()
+        ).hexdigest(),
+    }
+    return SampledTrainingData(
+        TrainingData(user_map, item_map, pairs), known, diagnostics,
+    )

@@ -136,3 +136,69 @@ def test_reproducible_mapping(tmp_path):
     second = load_training_data(path, BOUNDARIES)
 
     assert first == second
+
+
+def test_reservoir_reproducible_and_not_prefix(tmp_path):
+    from metafeed.training.kuairec_dataset import sample_training_data
+    path = tmp_path / "events.csv"
+    events = [(u, u, u, 1.0) for u in range(100)]
+    write_events(path, events)
+    first = sample_training_data(path, BOUNDARIES, 10, 42)
+    second = sample_training_data(path, BOUNDARIES, 10, 42)
+    third = sample_training_data(path, BOUNDARIES, 10, 43)
+    assert first == second
+    assert first.data.positive_pairs != third.data.positive_pairs
+    assert first.data.positive_pairs != tuple((u, u) for u in range(10))
+    assert len(first.data.positive_pairs) == 10
+    assert first.diagnostics["training_positive_events"] == 100
+    assert first.diagnostics["known_positive_pairs"] == 100
+    assert first.diagnostics["sampled_users"] == 10
+
+
+def test_complete_history_and_maps_ignore_heldout(tmp_path):
+    from metafeed.training.kuairec_dataset import sample_training_data
+    path = tmp_path / "events.csv"
+    write_events(path, [
+        (1, 10, 99, 1), (1, 20, 1, 1), (2, 30, 90, 1),
+        (3, 40, 80, 0.5), (999, 999, 100, 1), (888, 888, 200, 1),
+        (1, 999, 120, 1),
+    ])
+    sampled = sample_training_data(path, BOUNDARIES, 1, 42)
+    assert sampled.data.user_to_index == {1: 0, 2: 1, 3: 2}
+    assert sampled.data.item_to_index == {10: 0, 20: 1, 30: 2, 40: 3}
+    assert sampled.known_positives == {0: frozenset({0, 1}), 1: frozenset({2})}
+    assert len(sampled.data.positive_pairs) == 1
+    assert sampled.diagnostics["training_events"] == 4
+    assert sampled.diagnostics["known_positive_pairs"] == 3
+
+
+def test_reservoir_keeps_duplicate_events_and_days(tmp_path):
+    from collections import Counter
+    from metafeed.training.kuairec_dataset import sample_training_data
+    path = tmp_path / "events.csv"
+    write_events(path, [(1, 10, 1, 1), (1, 10, 1, 1), (2, 20, 90000, 1)])
+    sampled = sample_training_data(path, TemporalBoundaries(100000, 200000), 10, 42)
+    assert Counter(sampled.data.positive_pairs) == Counter({(0, 0): 2, (1, 1): 1})
+    assert sampled.diagnostics["sampled_events_by_utc_day"] == {0: 2, 1: 1}
+    assert sampled.diagnostics["training_positive_events_by_utc_day"] == {0: 2, 1: 1}
+    assert sampled.diagnostics["known_positive_pairs"] == 2
+
+
+@pytest.mark.parametrize("max_events,threshold", [(0, 1), (1, float("nan")), (1, -1)])
+def test_reservoir_rejects_invalid_parameters(tmp_path, max_events, threshold):
+    from metafeed.training.kuairec_dataset import sample_training_data
+    with pytest.raises(ValueError):
+        sample_training_data(tmp_path / "unused.csv", BOUNDARIES, max_events, 42, threshold)
+
+
+def test_full_catalog_matches_popularity_baseline(tmp_path):
+    from metafeed.data_pipeline.kuairec import iter_kuairec
+    from metafeed.evaluation.popularity import PopularityBaseline
+    from metafeed.training.kuairec_dataset import sample_training_data
+    path = tmp_path / "events.csv"
+    write_events(path, [(1, 10, 1, 1), (2, 20, 2, 0), (3, 30, 100, 1)])
+    baseline = PopularityBaseline()
+    baseline.fit(iter_kuairec(path), BOUNDARIES)
+    sampled = sample_training_data(path, BOUNDARIES, 1, 42)
+    assert set(sampled.data.item_to_index) == baseline.catalog
+    assert set(sampled.data.user_to_index) == baseline.training_users

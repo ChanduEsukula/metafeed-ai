@@ -2,26 +2,68 @@
 """Small reproducible KuaiRec two-tower training experiment."""
 
 import argparse
+import hashlib
 import json
+import os
+import platform
 import random
+import sys
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from metafeed.data_pipeline.kuairec import iter_kuairec
 from metafeed.evaluation.config import load_evaluation_config
 from metafeed.models.two_tower import TwoTowerModel
+from metafeed.training.kuairec_dataset import sample_training_data
+from metafeed.training.losses import masked_contrastive_loss
 from metafeed.training.sampler import batch_diagnostics, iter_training_batches
-from metafeed.training.losses import (
-    build_positive_lookup,
-    masked_contrastive_loss,
-)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "configs/datasets/kuairec.json"
 DEFAULT_OUTPUT = ROOT / "data/processed/kuairec/models"
+
+
+def select_device(name):
+    if name not in {"cpu", "mps", "cuda"}:
+        raise ValueError(f"Unsupported device: {name}")
+    if name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable; select a GPU runtime or use --device cpu")
+    if name == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS is unavailable")
+    return torch.device(name)
+
+
+def configure_reproducibility(seed):
+    # Must precede CUDA initialization. Fail rather than silently use nondeterminism.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+
+def process_peak_rss_bytes():
+    """Process lifetime high-water RSS, not per-epoch incremental memory."""
+    try:
+        import resource
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return int(peak if sys.platform == "darwin" else peak * 1024)
+    except (ImportError, AttributeError):
+        return None
+
+
+def synchronize(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 
 def train_epoch(model, optimizer, pairs, known_positives, batch_size, seed, epoch):
@@ -33,6 +75,10 @@ def train_epoch(model, optimizer, pairs, known_positives, batch_size, seed, epoc
     """
     device = next(model.parameters()).device
     model.train()
+    synchronize(device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    started = time.perf_counter()
     sizes = []
     losses = []
     visited = effective = valid = possible = skipped = 0
@@ -60,7 +106,19 @@ def train_epoch(model, optimizer, pairs, known_positives, batch_size, seed, epoc
         losses.append(loss.item())
         effective += stats.effective_interactions
 
+    synchronize(device)
+    elapsed = time.perf_counter() - started
     return {
+        "elapsed_seconds": elapsed,
+        "events_per_second": visited / elapsed if elapsed else 0.0,
+        "effective_events_per_second": effective / elapsed if elapsed else 0.0,
+        "process_peak_rss_bytes": process_peak_rss_bytes(),
+        "cuda_peak_allocated_bytes": (
+            torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None
+        ),
+        "cuda_peak_reserved_bytes": (
+            torch.cuda.max_memory_reserved(device) if device.type == "cuda" else None
+        ),
         "epoch": epoch + 1,
         # Arithmetic mean of optimizer-step batch means; null if no updates.
         "mean_training_loss": sum(losses) / len(losses) if losses else None,
@@ -104,11 +162,19 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--embedding-dim", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", choices=("cpu", "mps"), default="cpu")
+    parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default="cpu")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT / "two_tower_smoke.pt")
+    parser.add_argument("--source", type=Path, help="Override configured CSV path")
+    parser.add_argument("--report", type=Path, help="Exclusive JSON report; defaults beside checkpoint")
+    parser.add_argument("--prepare-only", action="store_true", help="Assess preprocessing without training")
     args = parser.parse_args()
+    report_path = args.report or args.output.with_suffix(".json")
+    if report_path.resolve() == args.output.resolve():
+        parser.error("Report and checkpoint paths must differ")
+    if report_path.exists():
+        raise FileExistsError(f"Report already exists: {report_path}")
 
-    if args.output.exists():
+    if not args.prepare_only and args.output.exists():
         raise FileExistsError(f"Checkpoint already exists: {args.output}")
 
     if min(
@@ -119,49 +185,59 @@ def main():
     ) <= 0:
         parser.error("Training parameters must be positive")
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-
+    if args.seed < 0 or args.seed >= 2**32:
+        parser.error("seed must be in [0, 2**32)")
+    started = time.perf_counter()
+    configure_reproducibility(args.seed)
+    device = select_device(args.device)
     config = load_evaluation_config(CONFIG_PATH)
-    path = ROOT / config.source_file
-
-    rows = []
-
-    for event in iter_kuairec(path):
-        if event.timestamp >= config.boundaries.train_end:
-            continue
-
-        if not config.is_positive(event.watch_ratio):
-            continue
-
-        rows.append((event.user_id, event.video_id))
-
-        if len(rows) >= args.max_events:
-            break
-
-    if not rows:
+    path = args.source or ROOT / config.source_file
+    prepared = sample_training_data(
+        path, config.boundaries, args.max_events, args.seed, config.positive_threshold,
+    )
+    data = prepared.data
+    if not data.positive_pairs:
         raise RuntimeError("No positive training interactions found")
-
-    user_ids = sorted({user for user, _ in rows})
-    item_ids = sorted({item for _, item in rows})
-
-    user_map = {user: idx for idx, user in enumerate(user_ids)}
-    item_map = {item: idx for idx, item in enumerate(item_ids)}
-
-    pairs = [
-        (user_map[user], item_map[item])
-        for user, item in rows
-    ]
-
-    # Sample-only lookup: full-data training needs ALL pre-cutoff positives,
-    # including events omitted from any training sample. Never use held-out data.
-    known_positives = build_positive_lookup(tuple(pairs))
-
-    device = torch.device(args.device)
-
-    if args.device == "mps" and not torch.backends.mps.is_available():
-        raise RuntimeError("MPS is unavailable")
+    pairs = data.positive_pairs
+    user_map, item_map = data.user_to_index, data.item_to_index
+    known_positives = prepared.known_positives
+    with path.open("rb") as handle:
+        source_sha256 = hashlib.file_digest(handle, "sha256").hexdigest()
+    metadata = {
+        "sampling": prepared.diagnostics,
+        "positive_lookup_scope": "complete_training_split",
+        "selection": prepared.diagnostics["strategy"],
+        "source_sha256": source_sha256,
+        "effective_source": str(path),
+        "dataset_config": json.loads(CONFIG_PATH.read_text()),
+        "config_sha256": hashlib.sha256(CONFIG_PATH.read_bytes()).hexdigest(),
+        "preprocessing_seconds": time.perf_counter() - started,
+        "preprocessing_peak_rss_bytes": process_peak_rss_bytes(),
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "torch_num_threads": torch.get_num_threads(),
+        "torch_version": str(torch.__version__),
+        "numpy_version": np.__version__,
+        "cuda_version": torch.version.cuda,
+        "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        "code_sha256": {
+            str(file.relative_to(ROOT)): hashlib.sha256(file.read_bytes()).hexdigest()
+            for file in [Path(__file__), *sorted((ROOT / "src/metafeed/training").glob("*.py")),
+                         ROOT / "src/metafeed/models/two_tower.py"]
+        },
+        "command": sys.argv,
+        "seed": args.seed, "device": str(device),
+        "batch_size": args.batch_size, "embedding_dim": args.embedding_dim,
+        "epochs": args.epochs,
+    }
+    print(json.dumps(metadata, sort_keys=True), flush=True)
+    if args.prepare_only:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with report_path.open("x") as handle:
+            json.dump(metadata, handle, indent=2, sort_keys=True)
+        return
 
     model = TwoTowerModel(
         num_users=len(user_map),
@@ -193,26 +269,33 @@ def main():
         "embedding_dim": args.embedding_dim,
         "seed": args.seed,
         "losses": losses,
-        "training_events": len(rows),
+        "training_events": len(pairs),
         "epoch_diagnostics": diagnostics,
         "batch_size": args.batch_size,
         "sampler": "deterministic_unique_items",
-        "positive_lookup_scope": "sampled_training_positives_only",
-        "selection": "first eligible positive events in source order",
-        "dataset_config": json.loads(CONFIG_PATH.read_text()),
-        "device": str(device),
+        **metadata,
     }
 
     save_checkpoint(checkpoint, output)
     restored_model, restored = restore_checkpoint(output)
-    assert restored["training_events"] == len(rows)
+    assert restored["training_events"] == len(pairs)
     for name, tensor in model.state_dict().items():
         torch.testing.assert_close(
             tensor.cpu(), restored_model.state_dict()[name], rtol=0, atol=0,
         )
 
+    metadata.update({
+        "epoch_diagnostics": diagnostics,
+        "total_elapsed_seconds": time.perf_counter() - started,
+        "process_peak_rss_bytes": process_peak_rss_bytes(),
+        "checkpoint": str(output), "checkpoint_restoration": "PASS",
+    })
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with report_path.open("x") as handle:
+        json.dump(metadata, handle, indent=2, sort_keys=True)
+
     print("Device:", device)
-    print("Positive events:", len(rows))
+    print("Positive events:", len(pairs))
     print("Users:", len(user_map))
     print("Items:", len(item_map))
     print("Mean batch size:", round(sum(s["visited_events"] for s in diagnostics) / sum(s["batches"] for s in diagnostics), 2))
