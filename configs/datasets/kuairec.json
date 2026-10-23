@@ -1,3 +1,4 @@
+
 {
   "dataset": "KuaiRec 2.0",
   "source_file": "data/raw/kuairec/KuaiRec 2.0/data/big_matrix.csv",
@@ -9,6 +10,20 @@
     "validation": 2130071,
     "test": 1612980
   },
-  "target_definition": null,
-  "version": 1
+  "target_definition": {
+    "field": "watch_ratio",
+    "operator": ">=",
+    "threshold": 1.0
+  },
+  "evaluation": {
+    "split": "test",
+    "k_values": [10],
+    "candidate_catalog": "training_observed_items",
+    "history_exclusion": "prior_positive_interactions",
+    "cold_start_policy": "exclude_and_report",
+    "missing_user_policy": "exclude_and_report",
+    "negative_sampling": "none",
+    "random_seed": 42
+  },
+  "version": 2
 }

@@ -50,3 +50,17 @@ def ndcg_at_k(
     )
 
     return dcg / idcg
+
+
+def hit_rate_at_k(
+    recommended: Sequence[int],
+    relevant: set[int],
+    k: int,
+) -> float:
+    """Return 1.0 when at least one relevant item is in the top K."""
+    _validate_recommendations(recommended, k)
+
+    if not relevant:
+        return 0.0
+
+    return float(any(item in relevant for item in recommended[:k]))
